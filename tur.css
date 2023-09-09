@@ -1,0 +1,52 @@
+.logo img{
+    width: 150px;
+}
+
+.iletisim{
+    display: flex;
+    justify-content: space-between;
+}
+
+ul{
+    list-style-type: none;
+    background-color: #494c5f; 
+    padding: 10px;
+    border-top: 3px solid orange;
+    border-right: 3px solid orange;
+    border-left: 3px solid orange;
+}
+li{
+    display: inline-block;
+    padding: 10px;
+}
+
+.resim img{
+    width: 100%;
+}
+
+.anasayfa p{
+    background-color: #494c5f;
+    padding: 10px;
+    border: 3px solid orange;
+}
+.manzaralar{
+    display: flex;
+    flex-wrap: wrap;
+}
+.kart{
+    width: 30%;
+    padding: 5px;
+    margin: 10px;
+    border: 3px solid gray;
+}
+.kart img{
+    width: 100%;
+}
+
+.kart h3{
+    background-color: orange;
+}
+.fiyat{
+    background-color: #494c5f;
+    text-align: right;
+}
