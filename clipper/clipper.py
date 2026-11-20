@@ -22,15 +22,29 @@ from hype import ChatMessage, Moment, detect, fmt
 
 
 # ---------------------------------------------------------------- Chat laden
-def load_chat(source: str, cache: Path) -> list[ChatMessage]:
-    """Chat aus Twitch/YouTube/Kick-VOD holen (oder aus lokaler JSON-Datei)."""
+def load_chat(source: str, cache: Path, start: float = 0, end: float | None = None) -> list[ChatMessage]:
+    """Chat aus Twitch/YouTube-VOD holen (oder aus lokaler JSON-Datei)."""
     if cache.exists():
         print(f"[chat] nutze Cache {cache}")
         return [ChatMessage(**m) for m in json.loads(cache.read_text())]
 
+    twitch = re.search(r"twitch\.tv/videos/(\d+)", source)
     if Path(source).is_file():
-        raw = json.loads(Path(source).read_text())
-        msgs = [ChatMessage(float(m["t"]), str(m.get("author", "?")), str(m["text"])) for m in raw]
+        raw = json.loads(Path(source).read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and "comments" in raw:   # TwitchDownloader-Export
+            from twitch_chat import load_twitchdownloader_json
+            msgs = [ChatMessage(*c) for c in load_twitchdownloader_json(source)]
+        else:
+            msgs = [ChatMessage(float(m["t"]), str(m.get("author", "?")), str(m["text"])) for m in raw]
+        msgs = [m for m in msgs if m.t >= start and (end is None or m.t <= end)]
+    elif twitch:
+        from twitch_chat import fetch_vod_chat
+        print(f"[chat] lade Twitch-Chat ab {fmt(start)}" + (f" bis {fmt(end)}" if end else "") + " ...")
+        msgs = []
+        for t, user, text in fetch_vod_chat(twitch.group(1), start, end):
+            msgs.append(ChatMessage(t, user, text))
+            if len(msgs) % 20000 == 0:
+                print(f"  {len(msgs)} Nachrichten, bei {fmt(t)}")
     else:
         from chat_downloader import ChatDownloader
         print("[chat] lade Chat herunter (kann bei langen Streams ein paar Minuten dauern)...")
@@ -57,6 +71,10 @@ def download_segment(url: str, m: Moment, out: Path) -> Path:
                         "-t", f"{m.end - m.start:.2f}", "-c:v", "libx264", "-preset", "veryfast",
                         "-c:a", "aac", str(out)], check=True)
         return out
+    try:
+        return _download_hls_section(url, m.start, m.end, out)
+    except Exception as e:  # kein HLS (z.B. YouTube) -> yt-dlp/ffmpeg
+        print(f"  (HLS-Direktdownload nicht möglich: {e}; nutze yt-dlp)")
     subprocess.run([
         sys.executable, "-m", "yt_dlp", url,
         "--download-sections", f"*{m.start:.0f}-{m.end:.0f}",
@@ -65,6 +83,52 @@ def download_segment(url: str, m: Moment, out: Path) -> Path:
         "--merge-output-format", "mp4",
         "-o", str(out), "--quiet", "--no-warnings", "--progress",
     ], check=True)
+    return out
+
+
+_HLS_CACHE: dict[str, tuple[str, list[tuple[float, float, str]]]] = {}
+
+
+def _download_hls_section(url: str, start: float, end: float, out: Path) -> Path:
+    """Lädt bei Twitch-VODs nur die .ts-Stücke, die den Abschnitt abdecken (per requests),
+    und schneidet dann lokal mit ffmpeg exakt zu."""
+    import requests
+    import yt_dlp
+    from urllib.parse import urljoin
+
+    if url not in _HLS_CACHE:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
+                               "format": "best[height<=1080][protocol^=m3u8]/best[protocol^=m3u8]"}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        m3u8 = info.get("url")
+        if not m3u8 or "m3u8" not in (info.get("protocol") or ""):
+            raise RuntimeError("kein m3u8")
+        text = requests.get(m3u8, timeout=60).text
+        segs, t, dur = [], 0.0, 0.0
+        for line in text.splitlines():
+            if line.startswith("#EXTINF:"):
+                dur = float(line[8:].split(",")[0])
+            elif line and not line.startswith("#"):
+                segs.append((t, dur, urljoin(m3u8, line)))
+                t += dur
+        _HLS_CACHE[url] = (m3u8, segs)
+    _, segs = _HLS_CACHE[url]
+    need = [s for s in segs if s[0] + s[1] > start and s[0] < end]
+    if not need:
+        raise RuntimeError("Zeitraum außerhalb des VODs")
+    ts = out.with_suffix(".ts")
+    with requests.Session() as sess, ts.open("wb") as f:
+        for _, _, seg_url in need:
+            r = sess.get(seg_url, timeout=60)
+            if r.status_code == 403 and "-unmuted" in seg_url:   # stummgeschaltete Teile
+                r = sess.get(seg_url.replace("-unmuted", "-muted"), timeout=60)
+            r.raise_for_status()
+            f.write(r.content)
+    offset = start - need[0][0]
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{offset:.2f}", "-i", str(ts),
+                    "-t", f"{end - start:.2f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-c:a", "aac", str(out)], check=True)
+    ts.unlink(missing_ok=True)
     return out
 
 
@@ -147,6 +211,8 @@ def main() -> None:
     ap.add_argument("--title", default="auto", help="Text oben im Video; 'auto', 'none' oder eigener Text")
     ap.add_argument("--send", choices=["none", "telegram", "discord"], default="none")
     ap.add_argument("--out", default="clips", help="Ausgabeordner")
+    ap.add_argument("--start", type=float, default=0, help="nur Chat ab Sekunde X auswerten")
+    ap.add_argument("--end", type=float, default=None, help="nur Chat bis Sekunde X auswerten")
     ap.add_argument("--only-detect", action="store_true", help="nur Momente finden, keine Videos")
     a = ap.parse_args()
 
@@ -155,8 +221,8 @@ def main() -> None:
 
     out = Path(a.out)
     (out / "raw").mkdir(parents=True, exist_ok=True)
-    slug = re.sub(r"\W+", "_", a.vod)[-40:]
-    msgs = load_chat(a.vod, out / f"chat_{slug}.json")
+    slug = re.sub(r"\W+", "_", a.vod)[-40:] + f"_{int(a.start)}_{int(a.end or 0)}"
+    msgs = load_chat(a.vod, out / f"chat_{slug}.json", a.start, a.end)
     moments = detect(msgs, top_n=a.top, pre_roll=a.pre, post_roll=a.post)
     if not moments:
         sys.exit("Keine Hype-Momente gefunden (zu wenig Chat?)")
