@@ -136,34 +136,40 @@ def _download_hls_section(url: str, start: float, end: float, out: Path) -> Path
     return out
 
 
-def locate_facecam(src: Path, facecam: str) -> str:
-    """'x,auto,w,h': sucht die y-Position des Facecam-Overlays selbst (Streamer verschieben es
-    manchmal). Nimmt mehrere Frames und sucht die Zeile mit den stärksten Kanten oben+unten."""
+def locate_facecam(src: Path, facecam: str, ss: float = 0, t: float | None = None) -> str | None:
+    """'x,auto,w,h': sucht die y-Position des Facecam-Rechtecks selbst (Streamer verschieben es).
+    Misst in 8 Frames die rechte Overlay-Kante. Nur wenn die Position in den meisten Frames
+    gleich ist, gilt sie als gefunden – sonst None (z.B. Greenscreen-Cam ohne Rahmen)."""
     x, y, w, h = facecam.split(",")
     if y != "auto":
         return facecam
     import numpy as np
     x, w, h = int(x), int(w), int(h)
-    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                            "-of", "csv=p=0", str(src)], capture_output=True, text=True)
-    dur = float(probe.stdout.strip() or 10)
-    acc = None
-    for frac in (0.2, 0.4, 0.6, 0.8):
-        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{dur * frac:.2f}", "-i", str(src),
+    if t is None:
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", str(src)], capture_output=True, text=True)
+        t = float(probe.stdout.strip() or 10) - ss
+    ys, ratios = [], []
+    for k in range(8):
+        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{ss + t * (k + 0.5) / 8:.2f}", "-i", str(src),
                               "-frames:v", "1", "-vf", "scale=1920:1080,format=gray", "-f", "rawvideo", "-"],
                              capture_output=True).stdout
         if len(raw) != 1920 * 1080:
             continue
         img = np.frombuffer(raw, np.uint8).reshape(1080, 1920).astype(np.int16)
-        # rechte Overlay-Kante: Sprung zwischen Spalte x+w-2 und x+w+1, pro Zeile
-        e = np.abs(img[:, x + w - 2] - img[:, x + w + 1]).astype(float)
-        acc = e if acc is None else acc + e
-    if acc is None:
-        raise RuntimeError("Facecam nicht gefunden")
-    csum = np.concatenate([[0], np.cumsum(acc)])
-    cand = csum[h:] - csum[:-h]                     # Summe über Fenster der Höhe h
-    best = int(cand.argmax())
-    return f"{x},{best},{w},{h}"
+        e = np.abs(img[:, x + w - 2] - img[:, x + w + 1]).astype(float)   # rechte Overlay-Kante
+        c = np.concatenate([[0], np.cumsum(e)])
+        win = (c[h:] - c[:-h]) / h
+        best = int(win.argmax())
+        ys.append(best)
+        ratios.append(win[best] / (np.median(e) + 1))
+    if not ys:
+        return None
+    med = int(np.median(ys))
+    agree = sum(abs(v - med) <= 8 for v in ys)
+    if agree < 0.6 * len(ys) or np.median(ratios) < 4:
+        return None
+    return f"{x},{med},{w},{h}"
 
 
 def _esc(text: str) -> str:
@@ -179,7 +185,11 @@ def render_vertical(src: Path, dst: Path, title: str | None, layout: str, faceca
     layout=crop    -> Mitte des Bildes auf 9:16 zuschneiden (gut für Just-Chatting / IRL)
     """
     if layout == "split" and facecam:
-        facecam = locate_facecam(src, facecam)
+        facecam = locate_facecam(src, facecam, ss or 0, t)
+        if facecam is None:
+            print("  (keine Facecam erkannt -> Layout ohne Split)")
+            layout = "blur"
+    if layout == "split" and facecam:
         x, y, w, h = facecam.split(",")
         vf = (f"[0:v]split[a][b];"
               f"[a]crop={w}:{h}:{x}:{y},scale=1080:768:force_original_aspect_ratio=increase,crop=1080:768[cam];"
