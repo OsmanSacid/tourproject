@@ -17,7 +17,7 @@ _NSFW = {"FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED", "MALE_GENITALIA_EX
          "BUTTOCKS_EXPOSED", "ANUS_EXPOSED"}
 # Wörter, bei denen der Clip zur manuellen Prüfung markiert/verworfen wird
 _NSFW_WORDS = re.compile(r"\b(porn\w*|onlyfans|nude\w*|naked|titt\w*|boob\w*|pussy|dick|cock|"
-                         r"sex|sexy|strip\w*|thong|cum\w*|horny|twerk\w*|stripper\w*|booty)\b", re.I)
+                         r"sex|sexy|strip\w*|thong|cum\w*|horny|twerk\w*|stripper\w*|booty|ass|jerk\w* off|nipple\w*)\b", re.I)
 
 
 def nsfw_frames(video: Path, fps: float = 1.0, thresh: float = 0.45) -> list[tuple[float, str, float]]:

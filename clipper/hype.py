@@ -95,11 +95,15 @@ def detect(
     hype = [0.0] * n
     count = [0] * n
     authors: list[set[str]] = [set() for _ in range(n)]
+    plain: list[dict[str, int]] = [{} for _ in range(n)]
     for m in messages:
         i = int(m.t // bucket)
         hype[i] += message_hype(m.text)
         count[i] += 1
         authors[i].add(m.author)
+        if message_hype(m.text) <= 1.0:          # Text ohne Hype-Emote/Caps (z.B. Giveaway-Wort)
+            key = m.text.strip().lower()
+            plain[i][key] = plain[i].get(key, 0) + 1
 
     # Gleitende Summe über `window` -> Hype pro Fenster; Spam einzelner User dämpfen
     w = max(1, int(window // bucket))
@@ -110,7 +114,17 @@ def detect(
         msgs = sum(count[lo:i + 1])
         uniq = len(set().union(*authors[lo:i + 1]))
         # viele verschiedene Leute = echter Hype, ein Spammer = kaum Wert
-        smooth.append(raw * (0.4 + 0.6 * (uniq / msgs if msgs else 0)))
+        val = raw * (0.4 + 0.6 * (uniq / msgs if msgs else 0))
+        # Giveaway-/Befehls-Spam ("type fun in chat"): viele gleiche Nachrichten ohne Hype -> kein Moment
+        merged: dict[str, int] = {}
+        for d in plain[lo:i + 1]:
+            for k, v in d.items():
+                merged[k] = merged.get(k, 0) + v
+        if msgs and merged:
+            share = max(merged.values()) / msgs
+            if share > 0.15:
+                val *= max(0.05, 1 - 2 * share)
+        smooth.append(val)
 
     # Vergleich mit rollierendem Median der letzten `baseline` Sekunden
     b = max(1, int(baseline // bucket))
