@@ -53,7 +53,10 @@ def fetch_vod_chat(vod_id: str, start: float = 0, end: float | None = None) -> I
 
 def load_twitchdownloader_json(path: str) -> list[tuple[float, str, str]]:
     """Import einer Chat-Datei aus TwitchDownloader (Chat Download -> JSON)."""
-    raw = json.load(open(path, encoding="utf-8"))
+    import gzip
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        raw = json.load(f)
     out = []
     for c in raw.get("comments", []):
         msg = c.get("message") or {}

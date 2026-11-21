@@ -30,7 +30,11 @@ def load_chat(source: str, cache: Path, start: float = 0, end: float | None = No
 
     twitch = re.search(r"twitch\.tv/videos/(\d+)", source)
     if Path(source).is_file():
-        raw = json.loads(Path(source).read_text(encoding="utf-8"))
+        if source.endswith(".gz"):
+            import gzip
+            raw = json.loads(gzip.open(source, "rt", encoding="utf-8").read())
+        else:
+            raw = json.loads(Path(source).read_text(encoding="utf-8"))
         if isinstance(raw, dict) and "comments" in raw:   # TwitchDownloader-Export
             from twitch_chat import load_twitchdownloader_json
             msgs = [ChatMessage(*c) for c in load_twitchdownloader_json(source)]
