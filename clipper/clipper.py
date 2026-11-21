@@ -136,6 +136,36 @@ def _download_hls_section(url: str, start: float, end: float, out: Path) -> Path
     return out
 
 
+def locate_facecam(src: Path, facecam: str) -> str:
+    """'x,auto,w,h': sucht die y-Position des Facecam-Overlays selbst (Streamer verschieben es
+    manchmal). Nimmt mehrere Frames und sucht die Zeile mit den stärksten Kanten oben+unten."""
+    x, y, w, h = facecam.split(",")
+    if y != "auto":
+        return facecam
+    import numpy as np
+    x, w, h = int(x), int(w), int(h)
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", str(src)], capture_output=True, text=True)
+    dur = float(probe.stdout.strip() or 10)
+    acc = None
+    for frac in (0.2, 0.4, 0.6, 0.8):
+        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{dur * frac:.2f}", "-i", str(src),
+                              "-frames:v", "1", "-vf", "scale=1920:1080,format=gray", "-f", "rawvideo", "-"],
+                             capture_output=True).stdout
+        if len(raw) != 1920 * 1080:
+            continue
+        img = np.frombuffer(raw, np.uint8).reshape(1080, 1920).astype(np.int16)
+        # rechte Overlay-Kante: Sprung zwischen Spalte x+w-2 und x+w+1, pro Zeile
+        e = np.abs(img[:, x + w - 2] - img[:, x + w + 1]).astype(float)
+        acc = e if acc is None else acc + e
+    if acc is None:
+        raise RuntimeError("Facecam nicht gefunden")
+    csum = np.concatenate([[0], np.cumsum(acc)])
+    cand = csum[h:] - csum[:-h]                     # Summe über Fenster der Höhe h
+    best = int(cand.argmax())
+    return f"{x},{best},{w},{h}"
+
+
 def _esc(text: str) -> str:
     return re.sub(r"([\\:'%,\[\]])", r"\\\1", text)
 
@@ -148,6 +178,7 @@ def render_vertical(src: Path, dst: Path, title: str | None, layout: str, faceca
     layout=crop    -> Mitte des Bildes auf 9:16 zuschneiden (gut für Just-Chatting / IRL)
     """
     if layout == "split" and facecam:
+        facecam = locate_facecam(src, facecam)
         x, y, w, h = facecam.split(",")
         vf = (f"[0:v]split[a][b];"
               f"[a]crop={w}:{h}:{x}:{y},scale=1080:768:force_original_aspect_ratio=increase,crop=1080:768[cam];"
@@ -211,8 +242,10 @@ def main() -> None:
     ap.add_argument("--pre", type=float, default=25, help="Sekunden vor der Chat-Spitze")
     ap.add_argument("--post", type=float, default=10, help="Sekunden nach der Chat-Spitze")
     ap.add_argument("--layout", choices=["blur", "split", "crop"], default="blur")
-    ap.add_argument("--facecam", help="Facecam-Bereich x,y,w,h für --layout split, z.B. 1500,780,420,300")
+    ap.add_argument("--facecam", help="Facecam-Bereich x,y,w,h für --layout split, z.B. 1500,780,420,300; y=auto sucht die Höhe selbst")
     ap.add_argument("--title", default="auto", help="Text oben im Video; 'auto', 'none' oder eigener Text")
+    ap.add_argument("--captions", action="store_true", help="Untertitel (was der Streamer sagt) einbrennen")
+    ap.add_argument("--lang", default="en", help="Sprache für Untertitel (en, de, ...)")
     ap.add_argument("--send", choices=["none", "telegram", "discord"], default="none")
     ap.add_argument("--out", default="clips", help="Ausgabeordner")
     ap.add_argument("--start", type=float, default=0, help="nur Chat ab Sekunde X auswerten")
@@ -247,6 +280,14 @@ def main() -> None:
             title = None if a.title == "none" else (
                 a.title if a.title != "auto" else (m.top_words[0].upper() + " MOMENT" if m.top_words else None))
             final = render_vertical(raw, out / f"{name}.mp4", title, a.layout, a.facecam)
+            if a.captions:
+                import captions
+                words = captions.transcribe(raw, lang=a.lang)
+                y = 768 if a.layout == "split" else 1400
+                tmp = final.with_suffix(".nocap.mp4")
+                final.replace(tmp)
+                captions.burn(tmp, captions.build_ass(words, y=y), final)
+                tmp.unlink()
         except subprocess.CalledProcessError as e:
             print(f"  ! Fehler: {e}")
             continue

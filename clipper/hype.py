@@ -124,7 +124,10 @@ def detect(
     order = sorted(range(n), key=lambda i: score[i], reverse=True)
     picked: list[int] = []
     gap = int(min_gap // bucket)
+    warmup = b if n > 3 * b else 0   # Stream-Anfang hat noch kein "Normal-Level"
     for i in order:
+        if i < warmup:
+            continue
         if score[i] <= 0.5:
             break
         if all(abs(i - j) >= gap for j in picked):
