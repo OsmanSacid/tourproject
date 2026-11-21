@@ -37,6 +37,14 @@ def nsfw_frames(video: Path, fps: float = 1.0, thresh: float = 0.45) -> list[tup
     return hits
 
 
+# Beleidigungen/Slurs: in Untertiteln auf TikTok/IG = Löschung/Bann -> Clip verwerfen
+_SLURS = re.compile(r"\b(nigg\w*|retard\w*|fag\w*|tranny)\b", re.I)
+
+
+def slur_words(words: list[tuple[float, float, str]]) -> list[str]:
+    return sorted({w.lower() for _, _, t in words for w in _SLURS.findall(t)})
+
+
 def nsfw_words(words: list[tuple[float, float, str]]) -> list[str]:
     return sorted({w for _, _, t in words for w in _NSFW_WORDS.findall(t)})
 

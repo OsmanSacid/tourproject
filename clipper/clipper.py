@@ -257,6 +257,17 @@ def send(path: Path, caption: str, target: str) -> None:
     print(f"  -> {target}: {'ok' if r.ok else r.text[:200]}")
 
 
+def parse_time(v) -> float:
+    """12345.6 | "3h49m12.5s" | "49m12s" -> Sekunden"""
+    if isinstance(v, (int, float)):
+        return float(v)
+    mm = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", v.strip())
+    if not mm or not any(mm.groups()):
+        return float(v)
+    h, mi, se = mm.groups()
+    return int(h or 0) * 3600 + int(mi or 0) * 60 + float(se or 0)
+
+
 # ---------------------------------------------------------------- Main
 def main() -> None:
     ap = argparse.ArgumentParser(description="Findet Hype-Momente im Chat und macht daraus Clips.")
@@ -333,6 +344,14 @@ def main() -> None:
         hook = next((v for k, v in titles.items() if k in name), None)
         if titles and hook is None and not a.review:
             continue                      # mit --titles nur die ausgewählten Clips rendern
+        fixed = None                      # {"title", "from", "to"}: exakter Schnitt (VOD-Zeit)
+        if isinstance(hook, dict):
+            fixed = (parse_time(hook["from"]), parse_time(hook["to"])) if "from" in hook else None
+            hook = hook.get("title")
+            if fixed:
+                m = Moment(peak=fixed[1], start=max(0.0, fixed[0] - 1), end=fixed[1] + 1, score=m.score,
+                           msgs_per_min=m.msgs_per_min, top_words=m.top_words)
+                name = f"{rank:02d}_{m.label()}"
         print(f"\n[{rank}/{len(moments)}] {name}")
         try:
             raw = download_segment(video, m, out / "raw" / f"{name}.mp4")
@@ -348,7 +367,12 @@ def main() -> None:
                 else:
                     words = captions.transcribe(raw, lang=a.lang)
                     wcache.write_text(json.dumps(words))
-            if a.max_len:
+            if fixed:
+                ss, e = fixed[0] - m.start, fixed[1] - m.start
+                dur = e - ss
+                words = [(w0 - ss, w1 - ss, t) for w0, w1, t in words if w0 >= ss - 0.1 and w1 <= e + 0.1]
+                print(f"  fester Ausschnitt: {dur:.0f}s")
+            elif a.max_len:
                 if a.no_context:
                     ss, e = pick_window(words, m.peak - m.start, m.end - m.start, a.min_len, a.max_len)
                 else:  # Kontext: Satzanfang als Start, Reaktion am Ende drin
@@ -374,6 +398,8 @@ def main() -> None:
                 problems.append(f"18+ Bild ({nude[0][1]} bei {nude[0][0]:.0f}s)")
             if bad_words:
                 problems.append(f"18+ Wörter: {', '.join(bad_words)}")
+            if quality.slur_words(words):
+                problems.append("Beleidigung/Slur im Text")
             if a.captions and len(words) < a.min_words:
                 problems.append(f"zu wenig Sprache für Untertitel ({len(words)} Wörter)")
             review.append({"name": name, "start": m.start + (ss or 0), "len": round(dur or 0, 1),
