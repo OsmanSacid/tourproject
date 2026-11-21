@@ -1,1 +1,3 @@
 clips_*/
+*.whl
+__pycache__/
