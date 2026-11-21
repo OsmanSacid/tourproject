@@ -170,7 +170,8 @@ def _esc(text: str) -> str:
     return re.sub(r"([\\:'%,\[\]])", r"\\\1", text)
 
 
-def render_vertical(src: Path, dst: Path, title: str | None, layout: str, facecam: str | None) -> Path:
+def render_vertical(src: Path, dst: Path, title: str | None, layout: str, facecam: str | None,
+                    ss: float | None = None, t: float | None = None) -> Path:
     """Macht aus 16:9 ein 1080x1920 Video.
 
     layout=blur    -> Gameplay in der Mitte, geblurrter Hintergrund (funktioniert immer)
@@ -200,13 +201,34 @@ def render_vertical(src: Path, dst: Path, title: str | None, layout: str, faceca
                f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=230[v]")
     else:
         vf += ";[v0]null[v]"
+    trim = (["-ss", f"{ss:.2f}"] if ss else []) + (["-t", f"{t:.2f}"] if t else [])
     subprocess.run([
-        "ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+        "ffmpeg", "-y", "-loglevel", "error", *trim, "-i", str(src),
         "-filter_complex", vf, "-map", "[v]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(dst),
     ], check=True)
     return dst
+
+
+def pick_window(words: list[tuple[float, float, str]], peak: float, total: float,
+                min_len: float = 15, max_len: float = 30) -> tuple[float, float]:
+    """Wählt den kurzen Ausschnitt (relativ zum Rohclip). Der krasse Moment passiert meist
+    5-20s VOR der Chat-Spitze. Start/Ende werden auf Sprechpausen gelegt, damit kein Satz
+    abgeschnitten wird."""
+    start, end = max(0.0, peak - 24), min(total, peak - 1)
+    # Schnittpunkte = Pausen zwischen Wörtern (Satzenden bevorzugt)
+    cuts = [(0.0, True), (total, True)]
+    for (s1, e1, w1), (s2, _, _) in zip(words, words[1:]):
+        if s2 - e1 > 0.25:
+            cuts.append(((e1 + s2) / 2, w1[-1:] in ".?!"))
+    def snap(t, lo, hi):
+        c = [(abs(x - t) - (1.5 if sent else 0), x) for x, sent in cuts if lo <= x <= hi]
+        return min(c)[1] if c else t
+    start = snap(start, start - 5, start + 4)
+    end = snap(end, max(start + min_len, end - 3), min(start + max_len, end + 6, total))
+    end = min(max(end, start + min_len), start + max_len, total)
+    return start, end
 
 
 # ---------------------------------------------------------------- Senden
@@ -244,6 +266,8 @@ def main() -> None:
     ap.add_argument("--layout", choices=["blur", "split", "crop"], default="blur")
     ap.add_argument("--facecam", help="Facecam-Bereich x,y,w,h für --layout split, z.B. 1500,780,420,300; y=auto sucht die Höhe selbst")
     ap.add_argument("--title", default="auto", help="Text oben im Video; 'auto', 'none' oder eigener Text")
+    ap.add_argument("--max-len", type=float, default=30, help="max. Clip-Länge in s (0 = ungekürzt)")
+    ap.add_argument("--min-len", type=float, default=15, help="min. Clip-Länge in s")
     ap.add_argument("--captions", action="store_true", help="Untertitel (was der Streamer sagt) einbrennen")
     ap.add_argument("--lang", default="en", help="Sprache für Untertitel (en, de, ...)")
     ap.add_argument("--send", choices=["none", "telegram", "discord"], default="none")
@@ -279,10 +303,18 @@ def main() -> None:
             raw = download_segment(video, m, out / "raw" / f"{name}.mp4")
             title = None if a.title == "none" else (
                 a.title if a.title != "auto" else (m.top_words[0].upper() + " MOMENT" if m.top_words else None))
-            final = render_vertical(raw, out / f"{name}.mp4", title, a.layout, a.facecam)
-            if a.captions:
+            ss = dur = None
+            words = []
+            if a.captions or a.max_len:
                 import captions
                 words = captions.transcribe(raw, lang=a.lang)
+            if a.max_len:
+                ss, e = pick_window(words, m.peak - m.start, m.end - m.start, a.min_len, a.max_len)
+                dur = e - ss
+                words = [(w0 - ss, w1 - ss, t) for w0, w1, t in words if w0 >= ss - 0.1 and w1 <= e + 0.1]
+                print(f"  Ausschnitt: {dur:.0f}s")
+            final = render_vertical(raw, out / f"{name}.mp4", title, a.layout, a.facecam, ss, dur)
+            if a.captions:
                 y = 768 if a.layout == "split" else 1400
                 tmp = final.with_suffix(".nocap.mp4")
                 final.replace(tmp)
