@@ -263,7 +263,8 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=8, help="Anzahl Clips (Standard 8)")
     ap.add_argument("--pre", type=float, default=25, help="Sekunden vor der Chat-Spitze")
     ap.add_argument("--post", type=float, default=10, help="Sekunden nach der Chat-Spitze")
-    ap.add_argument("--layout", choices=["blur", "split", "crop"], default="blur")
+    ap.add_argument("--layout", choices=["blur", "split", "crop", "auto"], default="blur",
+                    help="auto = pro Clip: Gameplay mit Facecam -> split, Vollbild-Kamera -> crop")
     ap.add_argument("--facecam", help="Facecam-Bereich x,y,w,h für --layout split, z.B. 1500,780,420,300; y=auto sucht die Höhe selbst")
     ap.add_argument("--title", default="auto", help="Text oben im Video; 'auto', 'none' oder eigener Text")
     ap.add_argument("--max-len", type=float, default=30, help="max. Clip-Länge in s (0 = ungekürzt)")
@@ -275,6 +276,10 @@ def main() -> None:
     ap.add_argument("--start", type=float, default=0, help="nur Chat ab Sekunde X auswerten")
     ap.add_argument("--end", type=float, default=None, help="nur Chat bis Sekunde X auswerten")
     ap.add_argument("--only-detect", action="store_true", help="nur Momente finden, keine Videos")
+    ap.add_argument("--brand", help="Sponsor-Modus: Momente mit Produkt finden (z.B. puffco)")
+    ap.add_argument("--no-chat", action="store_true", help="ohne Chat arbeiten ('vod' ist dann das Video)")
+    ap.add_argument("--scan-video", help="Datei/URL für die Sprach-Suche (z.B. 160p-Download des VODs)")
+    ap.add_argument("--scan-model", default="base.en", help="Whisper-Modell für die Sprach-Suche")
     a = ap.parse_args()
 
     if not shutil.which("ffmpeg") and not a.only_detect:
@@ -283,8 +288,16 @@ def main() -> None:
     out = Path(a.out)
     (out / "raw").mkdir(parents=True, exist_ok=True)
     slug = re.sub(r"\W+", "_", a.vod)[-40:] + f"_{int(a.start)}_{int(a.end or 0)}"
-    msgs = load_chat(a.vod, out / f"chat_{slug}.json", a.start, a.end)
-    moments = detect(msgs, top_n=a.top, pre_roll=a.pre, post_roll=a.post)
+    msgs = [] if a.no_chat else load_chat(a.vod, out / f"chat_{slug}.json", a.start, a.end)
+    if a.brand:
+        import brand
+        scan = a.scan_video or a.video or a.vod
+        tag = re.sub(r"\W+", "_", str(scan))[-40:]
+        words_all = brand.transcribe_full(scan, out / f"speech_{tag}.json", a.scan_model, a.lang)
+        words_all = [w for w in words_all if w[0] >= a.start and (a.end is None or w[0] <= a.end)]
+        moments = brand.find_moments(words_all, a.brand, msgs, top_n=a.top)
+    else:
+        moments = detect(msgs, top_n=a.top, pre_roll=a.pre, post_roll=a.post)
     if not moments:
         sys.exit("Keine Hype-Momente gefunden (zu wenig Chat?)")
 
@@ -296,6 +309,8 @@ def main() -> None:
         return
 
     video = a.video or a.vod
+    if a.layout == "auto" and not a.facecam:
+        sys.exit("--layout auto braucht --facecam x,y,w,h")
     for rank, m in enumerate(moments, 1):
         name = f"{rank:02d}_{m.label()}"
         print(f"\n[{rank}/{len(moments)}] {name}")
@@ -313,9 +328,14 @@ def main() -> None:
                 dur = e - ss
                 words = [(w0 - ss, w1 - ss, t) for w0, w1, t in words if w0 >= ss - 0.1 and w1 <= e + 0.1]
                 print(f"  Ausschnitt: {dur:.0f}s")
-            final = render_vertical(raw, out / f"{name}.mp4", title, a.layout, a.facecam, ss, dur)
+            layout = a.layout
+            if layout == "auto":
+                import brand
+                layout = brand.detect_layout(raw, a.facecam)
+                print(f"  Layout: {layout}")
+            final = render_vertical(raw, out / f"{name}.mp4", title, layout, a.facecam, ss, dur)
             if a.captions:
-                y = 768 if a.layout == "split" else 1400
+                y = 768 if layout == "split" else 1400
                 tmp = final.with_suffix(".nocap.mp4")
                 final.replace(tmp)
                 captions.burn(tmp, captions.build_ass(words, y=y), final)
