@@ -79,7 +79,7 @@ def prepare(a) -> None:
     cands = []
     if a.chat:
         msgs = load_chat(a.chat, out / "chat_cache.json", a.start, a.end)
-        for m in detect(msgs, top_n=a.top, pre_roll=a.pre, post_roll=15):
+        for m in detect(msgs, top_n=a.top, pre_roll=a.pre, post_roll=15)[a.skip:]:
             cands.append({"kind": "chat", "peak": m.peak, "start": m.start, "end": m.end,
                           "info": f"Chat-Hype {m.score} | {' '.join(m.top_words)} | {fmt(m.peak)}",
                           "chat": m.sample})
@@ -96,6 +96,7 @@ def prepare(a) -> None:
         d = rev / cid
         d.mkdir(exist_ok=True)
         raw = d / "raw.mp4"
+        (d / "info.txt").write_text(c["info"])
         try:
             if not raw.exists():
                 if c["kind"] == "chat":
@@ -166,6 +167,7 @@ def main() -> None:
     p.add_argument("--clips-of", help="Twitch-Kanal: Top-Clips als Kandidaten")
     p.add_argument("--range", default="7d")
     p.add_argument("--top", type=int, default=15, help="Anzahl Chat-Kandidaten")
+    p.add_argument("--skip", type=int, default=0, help="die ersten N Chat-Kandidaten überspringen (schon gesehen)")
     p.add_argument("--top-clips", type=int, default=10)
     p.add_argument("--pre", type=float, default=55, help="Vorlauf vor dem Chat-Fenster (Kontext)")
     p.add_argument("--start", type=float, default=0)
