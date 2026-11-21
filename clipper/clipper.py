@@ -231,6 +231,28 @@ def pick_window(words: list[tuple[float, float, str]], peak: float, total: float
     return start, end
 
 
+def finish_clip(raw: Path, dst: Path, peak: float, total: float, title: str | None, a) -> Path:
+    """Kürzen, 9:16 rendern, Untertitel einbrennen."""
+    ss = dur = None
+    words = []
+    if a.captions or a.max_len:
+        import captions
+        words = captions.transcribe(raw, lang=a.lang)
+    if a.max_len:
+        ss, e = pick_window(words, peak, total, a.min_len, a.max_len)
+        dur = e - ss
+        words = [(w0 - ss, w1 - ss, t) for w0, w1, t in words if w0 >= ss - 0.1 and w1 <= e + 0.1]
+        print(f"  Ausschnitt: {dur:.0f}s")
+    final = render_vertical(raw, dst, title, a.layout, a.facecam, ss, dur)
+    if a.captions:
+        y = 768 if a.layout == "split" else 1400
+        tmp = final.with_suffix(".nocap.mp4")
+        final.replace(tmp)
+        captions.burn(tmp, captions.build_ass(words, y=y), final)
+        tmp.unlink()
+    return final
+
+
 # ---------------------------------------------------------------- Senden
 def send(path: Path, caption: str, target: str) -> None:
     import requests
@@ -255,10 +277,43 @@ def send(path: Path, caption: str, target: str) -> None:
     print(f"  -> {target}: {'ok' if r.ok else r.text[:200]}")
 
 
+def clips_mode(a, out: Path) -> None:
+    """Meistgesehene Community-Clips eines Twitch-Kanals -> Reels im gleichen Style."""
+    import yt_dlp
+    rng = {"24h": "24hr", "7d": "7d", "30d": "30d", "all": "all"}[a.range]
+    url = f"https://www.twitch.tv/{a.clips_of}/clips?filter=clips&range={rng}"
+    with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "playlistend": a.top * 2}) as ydl:
+        entries = list(ydl.extract_info(url, download=False).get("entries") or [])
+    entries = sorted(entries, key=lambda e: e.get("view_count") or 0, reverse=True)[:a.top]
+    print(f"Top {len(entries)} Clips von {a.clips_of} ({a.range}):")
+    for rank, e in enumerate(entries, 1):
+        print(f" #{rank:<2} {e.get('view_count'):>7} Views  {e.get('duration')}s  {e.get('title')}")
+    for rank, e in enumerate(entries, 1):
+        slug = re.sub(r"\W+", "_", e.get("title") or "clip")[:30].strip("_")
+        name = f"{rank:02d}_{slug}"
+        raw = out / "raw" / f"{name}.mp4"
+        print(f"\n[{rank}/{len(entries)}] {name}")
+        try:
+            if not raw.exists():
+                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "outtmpl": str(raw),
+                                       "format": "best[height<=1080]"}) as ydl:
+                    ydl.download([e["url"]])
+            total = float(e.get("duration") or 30)
+            # Community-Clips enden meist kurz nach dem Höhepunkt -> "Spitze" ans Ende legen
+            final = finish_clip(raw, out / f"{name}.mp4", total + 1, total, a.title if a.title not in ("none", "auto") else None, a)
+        except Exception as ex:
+            print(f"  ! Fehler: {ex}")
+            continue
+        print(f"  fertig: {final}")
+        send(final, f"#{rank} {e.get('title')} ({e.get('view_count')} Views)\n{e['url']}", a.send)
+
+
 # ---------------------------------------------------------------- Main
 def main() -> None:
     ap = argparse.ArgumentParser(description="Findet Hype-Momente im Chat und macht daraus Clips.")
-    ap.add_argument("vod", help="Twitch/YouTube/Kick VOD-URL (oder Chat-JSON mit --video)")
+    ap.add_argument("vod", nargs="?", help="Twitch/YouTube/Kick VOD-URL (oder Chat-JSON mit --video)")
+    ap.add_argument("--clips-of", metavar="KANAL", help="statt Chat: meistgesehene Twitch-Clips dieses Kanals nehmen")
+    ap.add_argument("--range", default="7d", choices=["24h", "7d", "30d", "all"], help="Zeitraum für --clips-of")
     ap.add_argument("--video", help="Video-URL/Datei, falls 'vod' eine Chat-JSON ist")
     ap.add_argument("--top", type=int, default=8, help="Anzahl Clips (Standard 8)")
     ap.add_argument("--pre", type=float, default=25, help="Sekunden vor der Chat-Spitze")
@@ -282,6 +337,10 @@ def main() -> None:
 
     out = Path(a.out)
     (out / "raw").mkdir(parents=True, exist_ok=True)
+    if a.clips_of:
+        return clips_mode(a, out)
+    if not a.vod:
+        ap.error("VOD-URL/Chat-Datei oder --clips-of KANAL angeben")
     slug = re.sub(r"\W+", "_", a.vod)[-40:] + f"_{int(a.start)}_{int(a.end or 0)}"
     msgs = load_chat(a.vod, out / f"chat_{slug}.json", a.start, a.end)
     moments = detect(msgs, top_n=a.top, pre_roll=a.pre, post_roll=a.post)
@@ -303,23 +362,7 @@ def main() -> None:
             raw = download_segment(video, m, out / "raw" / f"{name}.mp4")
             title = None if a.title == "none" else (
                 a.title if a.title != "auto" else (m.top_words[0].upper() + " MOMENT" if m.top_words else None))
-            ss = dur = None
-            words = []
-            if a.captions or a.max_len:
-                import captions
-                words = captions.transcribe(raw, lang=a.lang)
-            if a.max_len:
-                ss, e = pick_window(words, m.peak - m.start, m.end - m.start, a.min_len, a.max_len)
-                dur = e - ss
-                words = [(w0 - ss, w1 - ss, t) for w0, w1, t in words if w0 >= ss - 0.1 and w1 <= e + 0.1]
-                print(f"  Ausschnitt: {dur:.0f}s")
-            final = render_vertical(raw, out / f"{name}.mp4", title, a.layout, a.facecam, ss, dur)
-            if a.captions:
-                y = 768 if a.layout == "split" else 1400
-                tmp = final.with_suffix(".nocap.mp4")
-                final.replace(tmp)
-                captions.burn(tmp, captions.build_ass(words, y=y), final)
-                tmp.unlink()
+            final = finish_clip(raw, out / f"{name}.mp4", m.peak - m.start, m.end - m.start, title, a)
         except subprocess.CalledProcessError as e:
             print(f"  ! Fehler: {e}")
             continue
