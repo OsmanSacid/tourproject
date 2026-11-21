@@ -171,7 +171,7 @@ def _esc(text: str) -> str:
 
 
 def render_vertical(src: Path, dst: Path, title: str | None, layout: str, facecam: str | None,
-                    ss: float | None = None, t: float | None = None) -> Path:
+                    ss: float | None = None, t: float | None = None, cx: float | None = None) -> Path:
     """Macht aus 16:9 ein 1080x1920 Video.
 
     layout=blur    -> Gameplay in der Mitte, geblurrter Hintergrund (funktioniert immer)
@@ -186,7 +186,9 @@ def render_vertical(src: Path, dst: Path, title: str | None, layout: str, faceca
               f"[b]crop=ih*1080/1152:ih,scale=1080:1152[game];"
               f"[cam][game]vstack[v0]")
     elif layout == "crop":
-        vf = "[0:v]crop=ih*9/16:ih,scale=1080:1920[v0]"
+        # cx = Bildposition (0..1) des Gesichts -> Ausschnitt darauf zentrieren
+        x = "(iw-ow)/2" if cx is None else f"max(0\\,min(iw-ow\\,iw*{cx:.3f}-ow/2))"
+        vf = f"[0:v]crop=ih*9/16:ih:{x}:0,scale=1080:1920[v0]"
     else:
         vf = ("[0:v]split[a][b];"
               "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5,eq=brightness=-0.15[bg];"
@@ -280,6 +282,12 @@ def main() -> None:
     ap.add_argument("--no-chat", action="store_true", help="ohne Chat arbeiten ('vod' ist dann das Video)")
     ap.add_argument("--scan-video", help="Datei/URL für die Sprach-Suche (z.B. 160p-Download des VODs)")
     ap.add_argument("--scan-model", default="base.en", help="Whisper-Modell für die Sprach-Suche")
+    ap.add_argument("--titles", help="JSON {Clip-Name oder Zeit: Hook-Titel}; nur diese Clips werden gerendert")
+    ap.add_argument("--review", action="store_true", help="nur laden+transkribieren+prüfen, review.json schreiben")
+    ap.add_argument("--no-context", action="store_true", help="alte Schnittlogik statt Satzanfang-Kontext")
+    ap.add_argument("--react-lag", type=float, default=4.0, help="Höhepunkt liegt so viele s vor der Chat-Spitze")
+    ap.add_argument("--min-words", type=int, default=8, help="min. erkannte Wörter, sonst Clip verwerfen")
+    ap.add_argument("--no-nsfw-check", action="store_true", help="18+-Bildprüfung (NudeNet) abschalten")
     a = ap.parse_args()
 
     if not shutil.which("ffmpeg") and not a.only_detect:
@@ -295,7 +303,14 @@ def main() -> None:
         tag = re.sub(r"\W+", "_", str(scan))[-40:]
         words_all = brand.transcribe_full(scan, out / f"speech_{tag}.json", a.scan_model, a.lang)
         words_all = [w for w in words_all if w[0] >= a.start and (a.end is None or w[0] <= a.end)]
-        moments = brand.find_moments(words_all, a.brand, msgs, top_n=a.top)
+        loud = None
+        if brand.PRESETS[a.brand].get("loud_weight"):
+            lcache = out / f"loud_{tag}.json"
+            if not lcache.exists():
+                print("[audio] messe Lautstärke ...")
+                lcache.write_text(json.dumps(brand.loudness(scan)))
+            loud = json.loads(lcache.read_text())
+        moments = brand.find_moments(words_all, a.brand, msgs, top_n=a.top, loud=loud)
     else:
         moments = detect(msgs, top_n=a.top, pre_roll=a.pre, post_roll=a.post)
     if not moments:
@@ -311,41 +326,88 @@ def main() -> None:
     video = a.video or a.vod
     if a.layout == "auto" and not a.facecam:
         sys.exit("--layout auto braucht --facecam x,y,w,h")
+    titles = json.loads(Path(a.titles).read_text()) if a.titles else {}
+    review = []
     for rank, m in enumerate(moments, 1):
         name = f"{rank:02d}_{m.label()}"
+        hook = next((v for k, v in titles.items() if k in name), None)
+        if titles and hook is None and not a.review:
+            continue                      # mit --titles nur die ausgewählten Clips rendern
         print(f"\n[{rank}/{len(moments)}] {name}")
         try:
             raw = download_segment(video, m, out / "raw" / f"{name}.mp4")
-            title = None if a.title == "none" else (
+            title = None if a.title == "none" or hook else (
                 a.title if a.title != "auto" else (m.top_words[0].upper() + " MOMENT" if m.top_words else None))
             ss = dur = None
             words = []
-            if a.captions or a.max_len:
+            if a.captions or a.max_len or a.review:
                 import captions
-                words = captions.transcribe(raw, lang=a.lang)
+                wcache = raw.with_suffix(".words.json")
+                if wcache.exists():
+                    words = [tuple(w) for w in json.loads(wcache.read_text())]
+                else:
+                    words = captions.transcribe(raw, lang=a.lang)
+                    wcache.write_text(json.dumps(words))
             if a.max_len:
-                ss, e = pick_window(words, m.peak - m.start, m.end - m.start, a.min_len, a.max_len)
+                if a.no_context:
+                    ss, e = pick_window(words, m.peak - m.start, m.end - m.start, a.min_len, a.max_len)
+                else:  # Kontext: Satzanfang als Start, Reaktion am Ende drin
+                    import quality
+                    ss, e = quality.context_window(words, m.peak - m.start - a.react_lag, m.end - m.start,
+                                                   a.min_len, a.max_len)
                 dur = e - ss
                 words = [(w0 - ss, w1 - ss, t) for w0, w1, t in words if w0 >= ss - 0.1 and w1 <= e + 0.1]
                 print(f"  Ausschnitt: {dur:.0f}s")
+            text = " ".join(t for _, _, t in words)
+            import quality
+            bad_words = quality.nsfw_words(words)
+            nude = []
+            if not a.no_nsfw_check:
+                cut = raw.with_suffix(".cut.mp4")
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{ss or 0:.2f}", "-i", str(raw),
+                                *(["-t", f"{dur:.2f}"] if dur else []), "-an", "-c:v", "libx264",
+                                "-preset", "ultrafast", str(cut)], check=True)
+                nude = quality.nsfw_frames(cut)
+                cut.unlink(missing_ok=True)
+            problems = []
+            if nude:
+                problems.append(f"18+ Bild ({nude[0][1]} bei {nude[0][0]:.0f}s)")
+            if bad_words:
+                problems.append(f"18+ Wörter: {', '.join(bad_words)}")
+            if a.captions and len(words) < a.min_words:
+                problems.append(f"zu wenig Sprache für Untertitel ({len(words)} Wörter)")
+            review.append({"name": name, "start": m.start + (ss or 0), "len": round(dur or 0, 1),
+                           "score": m.score, "problems": problems, "text": text})
+            if a.review:
+                print(f"  {'; '.join(problems) or 'ok'} | {text[:160]}")
+                continue
+            if problems:
+                print(f"  ! übersprungen: {'; '.join(problems)}")
+                continue
             layout = a.layout
             if layout == "auto":
                 import brand
                 layout = brand.detect_layout(raw, a.facecam)
                 print(f"  Layout: {layout}")
-            final = render_vertical(raw, out / f"{name}.mp4", title, layout, a.facecam, ss, dur)
-            if a.captions:
+            cx = quality.face_center(raw, ss or 0, dur) if layout == "crop" else None
+            final = render_vertical(raw, out / f"{name}.mp4", title, layout, a.facecam, ss, dur, cx)
+            if a.captions or hook:
+                import captions
                 y = 768 if layout == "split" else 1400
                 tmp = final.with_suffix(".nocap.mp4")
                 final.replace(tmp)
-                captions.burn(tmp, captions.build_ass(words, y=y), final)
+                captions.burn(tmp, captions.build_ass(words if a.captions else [], y=y, title=hook), final)
                 tmp.unlink()
+            quality.contact_sheet(final, final.with_suffix(".jpg"))
         except subprocess.CalledProcessError as e:
             print(f"  ! Fehler: {e}")
             continue
         print(f"  fertig: {final}")
         send(final, f"#{rank} {m.label()} | Hype {m.score} | Chat: {' '.join(m.top_words)}\n{video}", a.send)
-
+    if review:
+        (out / "review.json").write_text(json.dumps(review, indent=2, ensure_ascii=False))
+        if a.review:
+            print(f"\nReview gespeichert: {out / 'review.json'} – Titel in eine JSON schreiben und mit --titles rendern")
 
 if __name__ == "__main__":
     main()

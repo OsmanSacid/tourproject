@@ -36,39 +36,79 @@ PRESETS: dict[str, dict[str, dict[str, float]]] = {
             "cough": 2, "coughing": 2, "smoke": 1, "lungs": 1.5, "peak": 1.5,
         },
     },
+    # Ohne Sponsor: lustige/verrückte Reaktionen (wenn kein Chat da ist) – Sprache + Lautstärke
+    "reaction": {
+        "speech": {
+            "bro": 1, "bruh": 1.5, "what": 1, "wait": 1, "yo": 0.5, "god": 1, "holy": 1.5, "no": 0.5,
+            "crazy": 2, "insane": 2, "wild": 1.5, "npc": 2.5, "npcs": 2.5, "chat": 0.5, "dude": 1,
+            "hell": 1, "dead": 1, "died": 1, "funny": 1.5, "hilarious": 2, "clip": 2, "realistic": 2,
+            "physics": 2, "cops": 1.5, "police": 1.5, "run": 0.5, "help": 1, "stop": 0.5, "why": 1,
+        },
+        "chat": {},
+        "min_speech": 2,
+        "loud_weight": 3,
+    },
 }
 _WORD = re.compile(r"[\w']+|[^\w\s]", re.UNICODE)
 
 
-def transcribe_full(video: str | Path, cache: Path, model: str = "base.en", lang: str = "en"
-                    ) -> list[tuple[float, float, str]]:
-    """Transkribiert den ganzen Stream (Datei oder URL) einmal und cached das Ergebnis.
-    Für die Suche reicht ein kleines Modell; die Untertitel macht später 'small'."""
+def transcribe_full(video: str | Path, cache: Path, model: str = "base.en", lang: str = "en",
+                    chunk: float = 1800) -> list[tuple[float, float, str]]:
+    """Transkribiert den ganzen Stream (Datei oder URL) in 30-min-Stücken (wenig RAM, auch bei
+    24h-Marathons) und cached das Ergebnis; Teil-Fortschritt liegt in cache.partial."""
     if cache.exists():
         return [tuple(w) for w in json.loads(cache.read_text())]
     import numpy as np
     from faster_whisper import WhisperModel
-    print(f"[speech] transkribiere ganzen Stream ({model}) – das dauert eine Weile ...")
-    pcm = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(video), "-vn", "-ac", "1",
-                          "-ar", "16000", "-f", "f32le", "-"], check=True, capture_output=True).stdout
-    audio = np.frombuffer(pcm, np.float32)
-    segs, _ = WhisperModel(model, device="cpu", compute_type="int8").transcribe(
-        audio, language=lang, word_timestamps=True, vad_filter=True,
-        condition_on_previous_text=False, beam_size=1)
-    words = []
-    for s in segs:
-        words += [(round(w.start, 2), round(w.end, 2), w.word.strip()) for w in s.words or []]
-    cache.write_text(json.dumps(words))
-    print(f"[speech] {len(words)} Wörter")
-    return words
+    dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", str(video)], capture_output=True, text=True).stdout.strip())
+    part = cache.with_suffix(".partial")
+    state = json.loads(part.read_text()) if part.exists() else {"done": 0, "words": []}
+    wm = WhisperModel(model, device="cpu", compute_type="int8")
+    print(f"[speech] transkribiere {dur / 3600:.1f}h ({model}) ab {state['done'] / 60:.0f} min ...")
+    t0 = state["done"]
+    while t0 < dur:
+        pcm = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{t0}", "-t", f"{chunk}", "-i", str(video),
+                              "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                             check=True, capture_output=True).stdout
+        segs, _ = wm.transcribe(np.frombuffer(pcm, np.float32), language=lang, word_timestamps=True,
+                                vad_filter=True, condition_on_previous_text=False, beam_size=1)
+        for s in segs:
+            state["words"] += [(round(t0 + w.start, 2), round(t0 + w.end, 2), w.word.strip())
+                               for w in s.words or []]
+        t0 += chunk
+        state["done"] = t0
+        part.write_text(json.dumps(state))
+        print(f"[speech] {min(t0, dur) / 3600:.1f}h / {dur / 3600:.1f}h", flush=True)
+    cache.write_text(json.dumps(state["words"]))
+    part.unlink(missing_ok=True)
+    print(f"[speech] {len(state['words'])} Wörter")
+    return [tuple(w) for w in state["words"]]
 
 
 def _norm(t: str) -> str:
     return re.sub(r"[^\w']", "", t.lower())
 
 
+def loudness(video: str | Path, sr: int = 2000) -> list[float]:
+    """Lautstärke pro Sekunde (RMS), gestreamt -> auch bei 24h-Streams wenig RAM."""
+    import numpy as np
+    proc = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-i", str(video), "-vn", "-ac", "1",
+                             "-ar", str(sr), "-f", "s16le", "-"], stdout=subprocess.PIPE)
+    out = []
+    while True:
+        buf = proc.stdout.read(sr * 2 * 60)
+        if not buf:
+            break
+        a = np.frombuffer(buf[: len(buf) // 2 * 2], np.int16).astype(np.float32)
+        for i in range(0, len(a) - sr + 1, sr):
+            out.append(float(np.sqrt(np.mean(a[i:i + sr] ** 2))))
+    proc.wait()
+    return out
+
+
 def find_moments(words: list[tuple[float, float, str]], preset: str,
-                 msgs: list[ChatMessage] | None = None, top_n: int = 10,
+                 msgs: list[ChatMessage] | None = None, top_n: int = 10, loud: list[float] | None = None,
                  bucket: float = 5.0, window: float = 30.0, min_gap: float = 60.0,
                  lead: float = 8.0, tail: float = 22.0) -> list[Moment]:
     """Momente, in denen das Produkt vorkommt. Score = Sprache + Chat-Keywords + Chat-Hype.
@@ -100,17 +140,27 @@ def find_moments(words: list[tuple[float, float, str]], preset: str,
     def win(arr, i):
         return sum(arr[i:i + w])
 
+    # Lautstärke: lauter als die letzten 5 min (Schreien/Lachen) -> Bonus
+    loud_z = [0.0] * n
+    if loud:
+        import statistics
+        per_b = [max(loud[int(j * bucket):int((j + 1) * bucket)] or [0]) for j in range(n)]
+        for j in range(n):
+            past = per_b[max(0, j - 60):j] or [per_b[j]]
+            med = statistics.median(past)
+            loud_z[j] = max(0.0, min(3.0, (max(per_b[j:j + w] or [0]) - med) / (med + 1)))
+
     # Chat reagiert ~5-20s später -> Chat-Fenster etwas nach hinten verschoben
     lag = int(10 // bucket)
     score = []
     for i in range(n):
         s = win(speech, i)
-        if s < 3:            # ohne Produkt-Erwähnung im Gesprochenen kein Kandidat
+        if s < p.get("min_speech", 3):   # ohne passende Wörter im Gesprochenen kein Kandidat
             score.append(0.0)
             continue
         c = win(chat_kw, i + lag)
         h = win(hype, i + lag) / (base_hype * w)
-        score.append(s + 0.5 * c + 2.0 * min(h, 5))
+        score.append(s + 0.5 * c + 2.0 * min(h, 5) + p.get("loud_weight", 0) * loud_z[i])
 
     order = sorted(range(n), key=lambda i: score[i], reverse=True)
     picked: list[int] = []

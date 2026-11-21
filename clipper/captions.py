@@ -52,7 +52,7 @@ def _clean(word: str) -> str:
 
 
 def build_ass(words: list[tuple[float, float, str]], y: int = 768, per_line: int = 3,
-              font: str = "Inter ExtraBold", size: int = 86) -> str:
+              font: str = "Inter ExtraBold", size: int = 86, title: str | None = None) -> str:
     """ASS-Datei: Gruppen von bis zu `per_line` Wörtern, aktives Wort gelb mit Pop."""
     head = f"""[Script Info]
 ScriptType: v4.00+
@@ -96,6 +96,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     parts.append(t)
             pos = rf"{{\an5\pos(540,{y})}}"
             lines.append(f"Dialogue: 0,{_ts(start)},{_ts(end)},Cap,,0,0,0,,{pos}{' '.join(parts)}")
+    if title:  # Hook-Titel oben (eigener Style, liegt über allem)
+        import quality
+        st, ev = quality.title_ass(title, font=font)
+        head = head.replace("\n\n[Events]", f"\n{st}\n\n[Events]")
+        lines.insert(0, ev)
     return head + "\n".join(lines) + "\n"
 
 
